@@ -1,156 +1,223 @@
 # -*- coding: utf-8 -*-
 """
-Train Qwen3-8B on Dolci-Instruct-SFT (messages) using TRL SFTTrainer (v0.23.1)
-- Uses locally downloaded model + locally saved dataset (jsonl)
-- DeepSpeed ZeRO-2
+2_train_sft_model.py
+Train Qwen3-8B with tool-calling trajectories using TRL SFTTrainer.
+
+Input jsonl format (per line):
+  {"messages_json":"[...]", "tools_json":"[...]"}
+
+Key features:
+- Avoid pyarrow nested schema issues (we parse json strings in map).
+- Rank0 does preprocessing (render chat_template -> text) and save_to_disk once.
+  Other ranks wait and load from disk. (No duplicated preprocessing)
+- Control training data size ONLY by max sample count (deterministic & reproducible)
+- Save checkpoints by STEPS, keep the last 4 checkpoints
 """
 
 import os
 import json
 import random
+import argparse
 import torch
-from datasets import load_dataset
+import torch.distributed as dist
+
+from datasets import load_dataset, load_from_disk, Features, Value
 from transformers import AutoTokenizer
 from trl import SFTTrainer, SFTConfig
 
+
 # ======================
-# Global config (edit here)
+# EDIT THESE CONSTANTS
 # ======================
-# Local model path (downloaded via snapshot_download)
 MODEL_PATH = "/shared_workspace_mfs/ruochen/models/Qwen3-8B"
-
-# Local dataset path (downloaded/saved via datasets -> jsonl)
-TRAIN_JSONL = "/shared_workspace_mfs/ruochen/datasets/Dolci-Instruct-SFT/train.clean.jsonl"
-
+TRAIN_JSONL = "/shared_workspace_mfs/ruochen/datasets/Dolci-Instruct-SFT/train.qwen3_tool_sft.jsonl"
 OUTPUT_DIR = "/shared_workspace_mfs/ruochen/sft_proxy_model"
 DS_CONFIG = "ds_config_zero2.json"
 
+# how much data to really train
+MAX_TRAIN_SAMPLES = 200000      # set None for full dataset
+
 SEED = 42
-SMALL_TEST = False     # True: only run <=32 samples
 MAX_LENGTH = 2048
+NUM_PROC = 16
+
+PER_DEVICE_BS = 4
+GRAD_ACC = 4
+LR = 2e-5
+EPOCHS = 1
+
+COMPLETION_ONLY_LOSS = False  # tool-calling data: usually keep False
+
+# ---- checkpoint saving (Plan B) ----
+SAVE_STEPS = 10            # save every N optimizer steps
+SAVE_TOTAL_LIMIT = 4        # keep last 4 checkpoints
+
+# where to cache rendered text dataset (shared filesystem!)
+PREP_DIR = "/shared_workspace_mfs/ruochen/datasets/_cache_qwen3_tool_sft_text"
+# ======================
 
 
-def setup_env():
-    num_gpus = torch.cuda.device_count()
-    if num_gpus == 0:
-        raise RuntimeError("❌ No CUDA devices detected.")
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
-    print(f"🧠 Auto-detected {num_gpus} GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
+def is_dist() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
 
-    if "MASTER_PORT" not in os.environ:
-        os.environ["MASTER_PORT"] = str(random.randint(29500, 29999))
-        print(f"🔄 Assigned MASTER_PORT={os.environ['MASTER_PORT']}")
 
-    # Print DS ZeRO stage (so you KNOW it's Zero-2)
-    if os.path.exists(DS_CONFIG):
-        with open(DS_CONFIG, "r", encoding="utf-8") as f:
-            ds = json.load(f)
-        stage = ds.get("zero_optimization", {}).get("stage", None)
-        print(f"🧾 DeepSpeed ZeRO stage = {stage}")
+def get_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def ddp_init_if_needed():
+    if is_dist() and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(get_local_rank())
+
+
+def ddp_barrier():
+    if dist.is_initialized():
+        dist.barrier()
 
 
 def main():
-    setup_env()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="override MAX_TRAIN_SAMPLES (deterministic cap)",
+    )
+    args = parser.parse_args()
+
+    ddp_init_if_needed()
+    rank = get_rank()
+
+    max_train_samples = (
+        MAX_TRAIN_SAMPLES if args.max_samples is None else args.max_samples
+    )
+
+    if rank == 0:
+        print(f"🧠 rank={rank} world_size={os.environ.get('WORLD_SIZE','1')}")
+        print(f"📌 MODEL_PATH={MODEL_PATH}")
+        print(f"📌 TRAIN_JSONL={TRAIN_JSONL}")
+        print(f"📌 OUTPUT_DIR={OUTPUT_DIR}")
+        print(f"📌 max_samples={max_train_samples}")
+        print(f"💾 save_strategy=steps, save_steps={SAVE_STEPS}, save_total_limit={SAVE_TOTAL_LIMIT}")
+
     random.seed(SEED)
-
-    # ======================
-    # Load dataset (jsonl)
-    # ======================
-    if not os.path.exists(TRAIN_JSONL):
-        raise FileNotFoundError(f"❌ TRAIN_JSONL not found: {TRAIN_JSONL}")
-
-    print(f"📂 Loading dataset from: {TRAIN_JSONL}")
-    dataset = load_dataset("json", data_files=TRAIN_JSONL, split="train")
-    print(f"Loaded raw samples: {len(dataset):,}")
-    print("Columns:", dataset.column_names)
-
-    if SMALL_TEST:
-        dataset = dataset.select(range(min(32, len(dataset))))
-        print("⚠️ Using small test subset (<=32).")
-
-    # ======================
-    # Tokenizer (local)
-    # ======================
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"❌ MODEL_PATH not found: {MODEL_PATH}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ======================
-    # Filter & convert messages -> text
-    # ======================
-    def ends_with_assistant(example):
-        msgs = example.get("messages", [])
-        return (
-            isinstance(msgs, list)
-            and len(msgs) > 0
-            and msgs[-1].get("role") == "assistant"
-            and isinstance(msgs[-1].get("content", ""), str)
-            and len(msgs[-1]["content"].strip()) > 0
+    features = Features({
+        "messages_json": Value("string"),
+        "tools_json": Value("string"),
+    })
+
+    # ---- Preprocess once on rank0 ----
+    if rank == 0:
+        os.makedirs(PREP_DIR, exist_ok=True)
+
+        print(f"📂 Loading converted dataset: {TRAIN_JSONL}")
+        ds = load_dataset(
+            "json",
+            data_files=TRAIN_JSONL,
+            split="train",
+            features=features,
         )
+        print(f"✅ Loaded: {len(ds):,}")
 
-    dataset = dataset.filter(ends_with_assistant)
+        if max_train_samples is not None:
+            ds = ds.shuffle(seed=SEED).select(
+                range(min(max_train_samples, len(ds)))
+            )
+            print(f"🎯 Using {len(ds):,} samples (max_samples={max_train_samples})")
 
-    def to_text(example):
-        example["text"] = tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        return example
+        def to_text(ex):
+            messages = json.loads(ex["messages_json"])
+            tools = []
+            tj = ex.get("tools_json", "[]")
+            if tj:
+                try:
+                    tools = json.loads(tj)
+                    if not isinstance(tools, list):
+                        tools = []
+                except Exception:
+                    tools = []
+            ex["text"] = tokenizer.apply_chat_template(
+                messages,
+                tools=tools if tools else None,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            return ex
 
-    dataset = dataset.map(to_text, num_proc=8)
+        print("🧩 Rendering chat_template -> text ...")
+        ds = ds.map(to_text, num_proc=NUM_PROC)
 
-    # keep only text
-    remove_cols = [c for c in dataset.column_names if c != "text"]
-    if remove_cols:
-        dataset = dataset.remove_columns(remove_cols)
+        ds = ds.remove_columns([c for c in ds.column_names if c != "text"])
+        print("🔎 Preview text:\n", ds[0]["text"][:400])
 
-    print(f"📊 Final training samples: {len(dataset):,}")
-    print("🔎 Example text preview:\n", dataset[0]["text"][:300])
+        print(f"💾 Saving preprocessed dataset to: {PREP_DIR}")
+        ds.save_to_disk(PREP_DIR)
 
-    # ======================
-    # SFT config
-    # ======================
+    ddp_barrier()
+
+    # ---- All ranks load rendered dataset ----
+    ds = load_from_disk(PREP_DIR)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     config = SFTConfig(
         output_dir=OUTPUT_DIR,
-        gradient_checkpointing=True,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        learning_rate=2e-5,
-        num_train_epochs=1,
+
+        dataset_text_field="text",
+        max_length=MAX_LENGTH,
+        packing=False,
+
+        per_device_train_batch_size=PER_DEVICE_BS,
+        gradient_accumulation_steps=GRAD_ACC,
+        learning_rate=LR,
+        num_train_epochs=EPOCHS,
+
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         weight_decay=0.01,
+
         bf16=True,
-        logging_steps=50,
-        save_strategy="epoch",
-        save_total_limit=2,
+        gradient_checkpointing=True,
+        logging_steps=20,
+
+        # ✅ Plan B: save by steps, keep last 4 checkpoints
+        save_strategy="steps",
+        save_steps=SAVE_STEPS,
+        save_total_limit=SAVE_TOTAL_LIMIT,
+
         report_to="tensorboard",
+
         deepspeed=DS_CONFIG,
 
-        # --- SFT ---
-        max_length=MAX_LENGTH,
-        packing=False,
-        completion_only_loss=True,
-        dataset_text_field="text",
+        completion_only_loss=COMPLETION_ONLY_LOSS,
         eos_token=tokenizer.eos_token,
         pad_token=tokenizer.pad_token,
         model_init_kwargs={"torch_dtype": "bfloat16"},
     )
 
     trainer = SFTTrainer(
-        model=MODEL_PATH,          # ✅ use local model directory
+        model=MODEL_PATH,
         args=config,
         processing_class=tokenizer,
-        train_dataset=dataset,
+        train_dataset=ds,
     )
 
     trainer.train()
     trainer.save_model(OUTPUT_DIR)
-    print(f"\n🎯 Training complete! Model saved to: {OUTPUT_DIR}")
+
+    if rank == 0:
+        print(f"\n🎯 Training complete! Saved to: {OUTPUT_DIR}")
+        print(f"📌 Checkpoints: {OUTPUT_DIR}/checkpoint-* (keeping last {SAVE_TOTAL_LIMIT})")
 
 
 if __name__ == "__main__":
