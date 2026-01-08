@@ -20,9 +20,9 @@ from trl import SFTTrainer, SFTConfig
 MODEL_PATH = "/shared_workspace_mfs/ruochen/models/Qwen3-8B"
 
 # Local dataset path (downloaded/saved via datasets -> jsonl)
-TRAIN_JSONL = "/shared_workspace_mfs/ruochen/sft_dataset/Dolci-Instruct-SFT/train.jsonl"
+TRAIN_JSONL = "/shared_workspace_mfs/ruochen/datasets/Dolci-Instruct-SFT/train.clean.jsonl"
 
-OUTPUT_DIR = "./sft_output"
+OUTPUT_DIR = "/shared_workspace_mfs/ruochen/sft_proxy_model"
 DS_CONFIG = "ds_config_zero2.json"
 
 SEED = 42

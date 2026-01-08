@@ -54,7 +54,7 @@ pip install \
 pip install trl==0.23.1
 
 # ⚠️ DeepSpeed（如集群未预装才打开）
-# pip install deepspeed
+pip install deepspeed
 
 # ======================
 # Verify installation
