@@ -31,11 +31,11 @@ from trl import SFTTrainer, SFTConfig
 # ======================
 MODEL_PATH = "/shared_workspace_mfs/ruochen/models/Qwen3-8B"
 TRAIN_JSONL = "/shared_workspace_mfs/ruochen/datasets/Dolci-Instruct-SFT/train.qwen3_tool_sft.jsonl"
-OUTPUT_DIR = "/shared_workspace_mfs/ruochen/sft_proxy_model"
+OUTPUT_DIR = "/shared_workspace_mfs/ruochen/sft_proxy_model_2M"
 DS_CONFIG = "ds_config_zero2.json"
 
 # how much data to really train
-MAX_TRAIN_SAMPLES = 200000      # set None for full dataset
+MAX_TRAIN_SAMPLES = 100000      # set None for full dataset
 
 SEED = 42
 MAX_LENGTH = 2048
