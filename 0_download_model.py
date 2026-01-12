@@ -14,8 +14,8 @@ from huggingface_hub import snapshot_download
 # ======================
 # Config
 # ======================
-MODEL_ID = "Qwen/Qwen3-8B"
-LOCAL_DIR = "/shared_workspace_mfs/ruochen/models/Qwen3-8B"
+MODEL_ID = "Qwen/Qwen3-8B-Base"
+LOCAL_DIR = "/shared_workspace_mfs/ruochen/models/Qwen3-8B-Base"
 
 # 如果你在国内 / 私有镜像，可自行改 HF_ENDPOINT
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
